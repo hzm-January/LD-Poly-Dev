@@ -144,11 +144,11 @@ class kp(nn.Module):
         self.layer3 = self._make_layer(block, res_dims[2], layers[2], stride=res_strides[2])
         self.layer4 = self._make_layer(block, res_dims[3], layers[3], stride=res_strides[3])
 
-        hidden_dim = attn_dim
+        hidden_dim = attn_dim  # 32
         self.aux_loss = aux_loss
         self.position_embedding = build_position_encoding(hidden_dim=hidden_dim, type=pos_type)
-        self.query_embed = nn.Embedding(num_queries, hidden_dim)
-        self.input_proj = nn.Conv2d(res_dims[-1], hidden_dim, kernel_size=1)  # the same as channel of self.layer4
+        self.query_embed = nn.Embedding(num_queries, hidden_dim)  # 7 32
+        self.input_proj = nn.Conv2d(res_dims[-1], hidden_dim, kernel_size=1)  # the same as channel of self.layer4 128,32
 
         self.transformer = build_transformer(hidden_dim=hidden_dim,
                                              dropout=drop_out,
@@ -192,7 +192,7 @@ class kp(nn.Module):
         p = self.layer4(p)  # B 128 12 20 # p.shape[-2:](12,20)
         pmasks = F.interpolate(masks[:, 0, :, :][None], size=p.shape[-2:]).to(torch.bool)[0]  # mask(1,3,360,640) mask[:, 0, :, :](1,360,640)  mask[:, 0, :, :][None](1,1,360,640)  (1,1,12,20)[0]=(bs,12,20)
         pos    = self.position_embedding(p, pmasks)  # pmasks(bs,12,20) p(bs,128,12,20)  pos(bs,32,12,20)
-        hs, _, weights  = self.transformer(self.input_proj(p), pmasks, self.query_embed.weight, pos)  # hs.transpose(1, 2), memory.permute(1, 2, 0).view(bs, c, h, w), weights(7,32) pos(1,32,12,20)
+        hs, _, weights  = self.transformer(self.input_proj(p), pmasks, self.query_embed.weight, pos)  # p (1,128,12,20)-> (1,32,12,20) hs.transpose(1, 2), memory.permute(1, 2, 0).view(bs, c, h, w), weights(7,32) pos(1,32,12,20)
         output_class    = self.class_embed(hs)  # hs (2,bs,7,32) output_class  (2,bs,7,2) # models/py_utils/transformer.py forward(self, src, mask, query_embed, pos_embed)
         output_specific = self.specific_embed(hs)  # hs (2,bs,7,32) output_specific (2,bs,7,4)
         output_shared   = self.shared_embed(hs)  # output_shared (2,bs,7,4)
