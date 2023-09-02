@@ -19,18 +19,18 @@ class Transformer(nn.Module):
 
     def __init__(self, d_model=512, nhead=8, num_encoder_layers=6,
                  num_decoder_layers=6, dim_feedforward=2048, dropout=0.1,
-                 activation="relu", normalize_before=False,
+                 activation="gelu", normalize_before=False,
                  return_intermediate_dec=False):
         super().__init__()
-        encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
-                                                dropout, activation, normalize_before)
+        encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,  # d_model 32 nhead 2 dim_feedforward 128
+                                                dropout, activation, normalize_before)  # dropout 0.1 activation gelu  normalize_before False
         encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
-        self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm)  # layer, 6, norm
+        self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm)  # layer, num_encoder_layers 2, encoder_norm None #TODO 修改为一层encoder
 
-        decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward,  # d_model 32 nhead 2 num_encoder_layers 2
-                                                dropout, activation, normalize_before)
+        decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward,  # d_model 32 nhead 2 dim_feedforward 128
+                                                dropout, activation, normalize_before)  # dropout 0.1 activation gelu  normalize_before False
         decoder_norm = nn.LayerNorm(d_model)
-        self.decoder = TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm,
+        self.decoder = TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm,  #TODO 修改为一层decoder
                                           return_intermediate=return_intermediate_dec)
 
         self._reset_parameters()
@@ -38,10 +38,17 @@ class Transformer(nn.Module):
         self.d_model = d_model  # 256
         self.nhead = nhead  # 8
 
+        self.empty_token_embedding = nn.Embedding(100, 32)  # 创建100个词向量，词向量维度为32，实际使用时100要大于每个batch的样本数
+        self.pos_token_embedding = nn.Embedding(10000, 32)  # 创建10000个词向量，词向量维度为32，实际使用时10000要大于每个batch的样本数*每个样本中预设的车道线数
+        self.max_n_lane = 7
+
     def _reset_parameters(self):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
+
+    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
+        return tensor if pos is None else tensor + pos
 
     def forward(self, src, mask, query_embed, pos_embed):
         # flatten NxCxHxW to HWxNxC
@@ -50,22 +57,59 @@ class Transformer(nn.Module):
 
         pos_embed = pos_embed.flatten(2).permute(2, 0, 1)  # (1,32,12,20) -> (1,32,240) -> (240,1,32)
 
-        query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)  # (7,32) -> (7,1,32) -> (7,bs,32)
+        # query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)  # (7,32) -> (7,1,32) -> (7,bs,32)
 
         mask = mask.flatten(1)  # (1,12,20) -> (1,240)
 
-        tgt = torch.zeros_like(query_embed)  # (7,bs,32)
+        # tgt = torch.zeros_like(query_embed)  # (7,bs,32)
 
         #TODO: src不做处理，将src作为query，
         # Encoder 生成key,value
 
-        memory, weights = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)  # mask (1,240)  pos_embed (240,1,32)
-        # memory (240,bs,32) weights (bs,240,240)
-        hs = self.decoder(tgt, memory, memory_key_padding_mask=mask,
-                          pos=pos_embed, query_pos=query_embed)  # tgt (7,bs,32) mask (1,240) pos_embed (240,1,32) query_embed (7,bs,32) -> hs(2,7,bs,32)
+        # # tgt (7,bs,32) memory(240,bs,32) memory_key_padding_mask=mask (bs,240) pos=pos_embed (240,bs,32) query_pos=query_embed (7,bs,32) -> hs(2,7,bs,32)
+        # q = k = self.with_pos_embed(src, query_pos)  # tgt(7,bs,32) + query_pos(7,bs,32) -> (7,bs,32)
+        # # TODO: 针对q,q_pos自定义embedding tgt(1,bs,32) q_pos(1,bs,32)
+        # # tgt = torch.zeros_like(query_embed)  # (7,bs,32)
+        # # q_pos self.query_embed = nn.Embedding(num_queries, hidden_dim)  # 7 32
+        # # TODO: 每一个query和整个memory交互信息，得到一个新的query，累加，直到生成N+1条车道线，则索引[1:]的车道线就是当前图像的检测结果
+        # # TODO: [1,1,32] -> [7,1,32] -> [7,bs,32]
+        n_batch = src.shape[1]
+        for batch_id in range(n_batch):  # mask (1,240)  pos_embed (240,1,32)
 
-        return hs.transpose(1, 2), memory.permute(1, 2, 0).view(bs, c, h, w), weights  # memory(240,1,32) weights(1,240,240)
+            # TODO: 取出当前batch id的图像特征 (240,1,32)
+            latent_z = src[:, batch_id, :][:, None]  # (240,1,32)
 
+            memory_pos = pos_embed[:, batch_id, :][:, None]  # (240,1,32)
+            key_padding_mask_z = mask[batch_id, :][None]  # (bs,240)->(1,240)
+
+            # TODO: 生成一个初始query (1,1,32)，并对query进行编码，这个query在最后返回结果时会被裁剪
+            q_0 = self.empty_token_embedding(torch.LongTensor([batch_id]).cuda())[:, None]
+            # TODO: 最终的返回结果是(2,7,bs,32) 2 是两次decoder,7是7条车道线LSTR源代码中就是这么设置的，32是通道数
+            q_0_embedding = self.pos_token_embedding(torch.LongTensor([batch_id]).cuda())[:, None]  # (1, 1, 32) 第一个1是车道线，第二个1是bs
+            q_0 = self.with_pos_embed(q_0, q_0_embedding)
+            lane_feats = [q_0]
+
+            for idx in range(1, self.max_n_lane):
+
+                # TODO: 取出之前生成的当前车道线的embedding，其维度为 (7,bs,32)，-> (1,1,32)
+                # query_pos_cur_b_l = query_pos_cur_b[idx, :, :][None]  # (1,1,32)
+                q_pre = torch.cat(lane_feats, dim=0)  # (k,1,512)
+
+                # TODO: 将车道线送入encoder进行编码
+                q, _ = self.encoder(q_pre)
+
+                # TODO: 将车道线送入decoder进行解码
+                next_q = self.decoder(q, latent_z, memory_key_padding_mask=key_padding_mask_z,
+                                  query_pos=memory_pos)  # tgt (7,bs,32) mask (1,240) pos_embed (240,1,32) query_embed (7,bs,32) -> hs(2,7,bs,32)
+
+                # TODO: 对next_q进行embedding
+                next_q_embedding = self.pos_token_embedding(torch.LongTensor([(batch_id+1) * idx]).cuda())[:, None]
+                next_q_ = self.with_pos_embed(next_q, next_q_embedding)
+                lane_feats.append(next_q_)
+
+        lane_feats = torch.cat(lane_feats[1:], dim=0)  # [(1,1,512),(1,1,512),...] -> (1,K,512) # (7,bs,32)
+        lane_feats = lane_feats.unsqueeze(0) # TODO: 为了兼容之后的代码，因为设置了不保存中间结果return_intermediate_dec=False
+        return lane_feats.transpose(1,2) # (1,7,bs,32) -> (1,bs,7,32)
 
 class TransformerEncoder(nn.Module):
 
@@ -127,8 +171,8 @@ class TransformerDecoder(nn.Module):
                 intermediate.pop()
                 intermediate.append(output)
 
-        if self.return_intermediate: # return_intermediate True
-            return torch.stack(intermediate)  #[(7,16,32),(7,16,32)]->(2,7,16,32)
+        if self.return_intermediate:  # return_intermediate True
+            return torch.stack(intermediate)  # [(7,16,32),(7,16,32)]->(2,7,16,32)
 
         return output
 
@@ -136,7 +180,7 @@ class TransformerDecoder(nn.Module):
 class TransformerEncoderLayer(nn.Module):
 
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
-                 activation="relu", normalize_before=False):
+                 activation="gelu", normalize_before=False):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
         # Implementation of Feedforward model
@@ -204,7 +248,7 @@ class TransformerEncoderLayer(nn.Module):
 class TransformerDecoderLayer(nn.Module):
 
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
-                 activation="relu", normalize_before=False):
+                 activation="gelu", normalize_before=False):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
         self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)  # d_model 32 nhead 2
@@ -228,69 +272,39 @@ class TransformerDecoderLayer(nn.Module):
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
 
-    def forward_post(self, tgt, memory,
+    def forward_post(self, q, key_value,
                      tgt_mask: Optional[Tensor] = None,  # None #TODO：原代码中没有对tgt使用tgt_mask，不知为何
                      memory_mask: Optional[Tensor] = None,  # None
                      tgt_key_padding_mask: Optional[Tensor] = None,  # None #TODO：原代码中没有对tgt使用tgt_key_padding_mask，不知为何
                      memory_key_padding_mask: Optional[Tensor] = None,  # (bs,240)
                      pos: Optional[Tensor] = None,  # (240,bs,32)  #  pos 是memory的pos
                      query_pos: Optional[Tensor] = None):  # query_embed (7,bs,32)
-        # tgt (7,bs,32) memory(240,bs,32) memory_key_padding_mask=mask (bs,240) pos=pos_embed (240,bs,32) query_pos=query_embed (7,bs,32) -> hs(2,7,bs,32)
-        q = k = self.with_pos_embed(tgt, query_pos)  # tgt(7,bs,32) + query_pos(7,bs,32) -> (7,bs,32)
-        # TODO: 针对q,q_pos自定义embedding tgt(1,bs,32) q_pos(1,bs,32)
-        # tgt = torch.zeros_like(query_embed)  # (7,bs,32)
-        # q_pos self.query_embed = nn.Embedding(num_queries, hidden_dim)  # 7 32
-        # TODO: 每一个query和整个memory交互信息，得到一个新的query，累加，直到生成N+1条车道线，则索引[1:]的车道线就是当前图像的检测结果
-        # TODO: [1,1,32] -> [7,1,32] -> [7,bs,32]
-        n_batch = tgt.shape[1]
-        for batch_id in range(1, n_batch+1):  # mask (1,240)  pos_embed (240,1,32)
-            # TODO: 取出当前batch id的图像特征 (240,1,32)
-            latent_z = memory[:, batch_id, :][:, None]  # (240,1,32)
-            memory_pos = pos[:, batch_id, :][:, None]  # (240,1,32)
-            key_padding_mask_z = memory_key_padding_mask[batch_id, :][:, None]  # (bs,240)
-            query_pos_cur_b = query_pos[:, batch_id, :][:, None]  # query_embed (7,bs,32)
-            # TODO: 生成一个query (1,1,32)，并对query进行编码
-            q_0 = self.empty_token_embedding(torch.LongTensor([batch_id]).cuda())[:, None]
-            q_0_embedding = nn.Embedding(1, 32)
-            q_0 = self.with_pos_embed(q_0, q_0_embedding.weight)
-            lane_feats = [q_0]
-            for idx in range(self.max_n_lane):
-                #TODO: 取出之前生成的当前车道线的embedding，其维度为 (7,bs,32)，-> (1,1,32)
-                query_pos_cur_b_l = query_pos_cur_b[idx, :, :][None]  # (1,1,32)
-                q = torch.cat(lane_feats, dim=1)  # (1,k,512)
+        # memory_key_padding_mask = mask,
+        # pos = pos_embed
+        #TODO: kv 是已经经过编码的key和value,暂定不需要embedding
+        # key_value = q_ = self.with_pos_embed(kv, query_pos)  # tgt(7,bs,32) + query_pos(7,bs,32) -> (7,bs,32)
+        tgt2 = self.self_attn(q, q, value=q)[0]  # memory_key_padding_mask (1,240)
 
-                # TODO: X进行自注意力机制  # tgt2 (7,bs,32)
-                q_ = self.self_attn(q, q, value=q)[0]
+        q = q + self.dropout1(tgt2)  # tgt(7,bs,32) + (7,bs,32) -> (7,bs,32)
 
-                q_ = q + self.dropout1(q_)  # tgt(7,bs,32) + (7,bs,32) -> (7,bs,32)
+        q = self.norm1(q)  # (7,bs,32) -> (7,bs,32)
 
-                q_ = self.norm1(q_)  # (7,bs,32) -> (7,bs,32)
+        tgt2 = self.multihead_attn(query=q,  # tgt(7,bs,32)  query_pos(7,bs,32)
+                                   key=self.with_pos_embed(key_value, query_pos),  # memory(240,bs,32)  pos(240,bs,32)
+                                   value=self.with_pos_embed(key_value, query_pos))[0]  # memory_key_padding_mask (bs,240)
+                                    # , attn_mask = None,  # memory_mask None
+                                    # key_padding_mask = memory_key_padding_mask
+        q = q + self.dropout2(tgt2)  # kv (1,1,32) tgt2 (240,1,32)
 
-                # X = self.transformer_encoder(X, length_mask=None)  # (1,k,512) -> (1,k,512)
-                # last_feat = self.transformer_decoder(latent_z, X)  # latent_z (1,1,512), X (1,k,512) -> (1,1,512)
-                last_feat = self.multihead_attn(query=self.with_pos_embed(latent_z, memory_pos),  # tgt(7,bs,32)  query_pos(7,bs,32)
-                                    key=self.with_pos_embed(q_, query_pos_cur_b_l),  # memory(240,bs,32)  pos(240,bs,32)
-                                    value=q_, attn_mask=memory_mask,  # memory_mask None
-                                    key_padding_mask=key_padding_mask_z)[0]  # memory_key_padding_mask (bs,240)
-                # last_feat = self.encoders[idx](last_feat)  # (1,1,512) -> (1,1,512)
-                # tuple2 - 0 attn_output (7,1,32) 1 attn_output_weight (1,7,240)
-                new_q = q_ + self.dropout2(last_feat)  # (7,bs,32) -> (7,bs,32)  tgt2 (7,1,32)
+        q = self.norm2(q)  # (7,bs,32) -> (7,bs,32)
 
-                new_q = self.norm2(new_q)  # (7,bs,32) -> (7,bs,32)
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(q))))  # (7,bs,32) -> (7,bs,32)
 
-                new_q_ = self.linear2(self.dropout(self.activation(self.linear1(new_q))))  # (7,bs,32) -> (7,bs,32)
+        q = q + self.dropout3(tgt2)  # (7,bs,32) -> (7,bs,32)
 
-                new_q_ = new_q + self.dropout3(new_q_)  # (7,bs,32) -> (7,bs,32)
+        q = self.norm3(q)  # (7,bs,32) -> (7,bs,32)
 
-                new_q_ = self.norm3(new_q_)  # (7,bs,32) -> (7,bs,32)
-                # TODO: 对last_feat进行embedding
-                q_embedding = nn.Embedding(1, 32)
-                new_q_ = self.with_pos_embed(new_q_, q_embedding.weight)
-                lane_feats.append(new_q_)
-
-        lane_feats = torch.cat(lane_feats[1:], dim=1)  # [(1,1,512),(1,1,512),...] -> (1,K,512)
-
-        return lane_feats # (7,bs,32)
+        return q
 
     def forward_pre(self, tgt, memory,
                     tgt_mask: Optional[Tensor] = None,

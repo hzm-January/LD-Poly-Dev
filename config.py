@@ -61,7 +61,7 @@ class Config:
         self._configs["aux_loss"] = True
         self._configs["pos_type"] = 'sine'
         self._configs["pre_norm"] = False
-        self._configs["return_intermediate"] = True
+        self._configs["return_intermediate"] = False
 
         self._configs["block"] = "BasicBlock"
         self._configs["lane_categories"] = 2
